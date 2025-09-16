@@ -1,0 +1,659 @@
+package main
+
+import (
+    "bytes"
+    "errors"
+    "flag"
+    "fmt"
+    "log"
+    "io"
+    "encoding/xml"
+    "encoding/json"
+    "net/http"
+    "net/url"
+    "strings"
+    "time"
+
+    "database/sql"
+    sqlite_vec "github.com/asg017/sqlite-vec-go-bindings/cgo"
+    _ "github.com/mattn/go-sqlite3"
+)
+
+
+const ARXIV_RSS_URL = "https://rss.arxiv.org/rss/"
+
+const RSS_TIME_LAYOUT_STR = "Mon, 02 Jan 2006 15:04:05 -0700"
+const ISO_86O1_TIME_LAYOUT_STR = "2006-01-02 15:04:05"
+
+
+const EMBED_MODEL = "nomic-embed-text:v1.5"
+const EMBED_URL = "http://127.0.0.1:11434/api/embed"
+const EMBED_DIM = 768
+
+
+
+type OAI struct {
+    XMLName      xml.Name   `xml:"OAI-PMH"`
+    ResponseDate string     `xml:"responseDate"` 
+    Request      OAIRequest `xml:"request"`
+    ListSets     *ListSets  `xml:"ListSets"`
+    Error        *OAIError  `xml:"error"`        // OAI-PMH can return <error> instead
+}
+
+type OAIRequest struct {
+    Verb string `xml:"verb,attr"`
+    URL  string `xml:",chardata"`
+}
+
+type ListSets struct {
+    Sets            []Set  `xml:"set"`
+    ResumptionToken string `xml:"resumptionToken"`
+}
+
+type Set struct {
+    Spec string `xml:"setSpec"`
+    Name string `xml:"setName"`
+}
+
+type OAIError struct {
+    Code string `xml:"code,attr"`
+    Text string `xml:",chardata"`
+}
+
+
+type ArxSubject struct {
+    Name string
+    DotPath string
+    IsTop bool
+    Parent string
+}
+
+
+type AtomLink struct {
+	Href string `xml:"href,attr"`
+	Rel  string `xml:"rel,attr"`
+	Type string `xml:"type,attr"`
+}
+
+type GUID struct {
+	Value        string `xml:",chardata"`
+	IsPermaLink  bool   `xml:"isPermaLink,attr"`
+}
+
+type RSSItem struct {
+	Title        string   `xml:"title"`
+	Link         string   `xml:"link"`
+	Description  string   `xml:"description"`
+	GUID         GUID     `xml:"guid"`
+	Categories   []string `xml:"category"`
+	PubDate      string   `xml:"pubDate"`
+	AnnounceType string   `xml:"http://arxiv.org/schemas/atom announce_type"`
+	DCCreator    string   `xml:"http://purl.org/dc/elements/1.1/ creator"`
+}
+
+type RSS struct {
+	XMLName xml.Name   `xml:"rss"`
+	Channel RSSChannel `xml:"channel"`
+}
+
+type RSSChannel struct {
+	Title         string    `xml:"title"`
+	Link          string    `xml:"link"`
+	Desc          string    `xml:"description"`
+	AtomSelfLink  AtomLink  `xml:"http://www.w3.org/2005/Atom link"` // <atom:link .../>
+	Docs          string    `xml:"docs"`
+	Lang          string    `xml:"language"`
+	LastBuildDate string    `xml:"lastBuildDate"`
+	Editor        string    `xml:"managingEditor"`
+	PubDate       string    `xml:"pubDate"`
+	SkipDays      []string  `xml:"skipDays>day"`
+	Items         []RSSItem `xml:"item"`
+}
+
+
+type PaperResult struct {
+    ArxivId string
+    Title string
+    Desc string
+    PubDate string
+    Score float32
+}
+
+
+func ollamaEmbed(toEmbed []string) ([][EMBED_DIM]float32) {
+    toEmbedNomic := make([]string, len(toEmbed))
+    prefix := "clustering: "
+
+    for i,str := range toEmbed {
+        toEmbedNomic[i] = prefix + str
+    }
+
+    reqBodyStruct := struct {
+        Model   string     `json:"model"`
+        Input  []string   `json:"input"`
+    }{
+        Model: EMBED_MODEL,
+        Input: toEmbedNomic,
+    }
+
+    reqBody, err := json.Marshal(reqBodyStruct)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    req, err := http.NewRequest("POST", EMBED_URL, bytes.NewReader(reqBody))
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    req.Header.Set("Content-Type", "application/json")
+    client := http.Client{Timeout: 5 * time.Minute}
+
+
+    resp, err := client.Do(req)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer resp.Body.Close()
+
+    respBody, err := io.ReadAll(resp.Body)
+    if err != nil {
+        log.Fatal(err)
+    }
+    if (resp.StatusCode != http.StatusOK) {
+        log.Fatalf("Request error. Got status: %s\n%s\n", resp.StatusCode, respBody)
+    }
+
+
+    res := struct {
+        Model           string                  `json:"model"`
+        Embeddings      [][EMBED_DIM]float32    `json:"embeddings"`
+        TotalDuration   uint64                  `json:"total_duration"`
+        LoadDuration    uint64                  `json:"load_duration"`
+        PromptEvalCount uint64                  `json:"prompt_eval_count"`
+    }{}
+
+
+    err = json.Unmarshal(respBody, &res)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    
+    return res.Embeddings
+}
+
+
+
+
+
+
+func RefreshSubjects(db *sql.DB) error {
+    base := "http://export.arxiv.org/oai2"
+    verb := "ListSets"
+
+    // BEGIN FETCH SUBJECT LIST
+    subjects := []ArxSubject{}
+    for token := ""; ; {
+        q := url.Values{"verb": {verb}}
+        if token != "" {
+            q.Set("resumptionToken", token)
+        }
+        u := base + "?" + q.Encode()
+
+        resp, err := http.Get(u)
+        if err != nil {
+            return err
+        }
+        body, err := io.ReadAll(resp.Body)
+        resp.Body.Close()
+        if err != nil {
+            return err
+        }
+
+        var doc OAI
+        if err := xml.Unmarshal(body, &doc); err != nil {
+            return err
+        }
+        if doc.Error != nil {
+            return fmt.Errorf("oai error (%s): %s", doc.Error.Code, doc.Error.Text)
+        }
+        if doc.ListSets == nil {
+            break
+        }
+
+        for _, s := range doc.ListSets.Sets {
+            dotPath := strings.Split(s.Spec, ":")
+            subj := ArxSubject{Name:s.Name}
+
+            if len(dotPath) >= 2 && dotPath[0] == dotPath[1] {
+                dotPath = dotPath[1:]
+            }
+            if len(dotPath) == 1 {
+                subj.IsTop = true
+            } else {
+                subj.IsTop = false
+                subj.Parent = strings.Join(dotPath[:len(dotPath)-1], ".")
+            }
+            subj.DotPath = strings.Join(dotPath, ".")
+            
+            subjects = append(subjects, subj)
+        }
+
+        token = doc.ListSets.ResumptionToken
+        if token == "" {
+            break
+        }
+    }    
+    // END FETCH SUBJECT LIST
+
+    // BEGIN ADD LIST TO DB
+    tx, err := db.Begin()
+    if err != nil {
+        return err
+    }
+
+    stmt, err := tx.Prepare("INSERT OR IGNORE INTO categories (name, dot_path, parent, is_top) VALUES (?,?,?,?)")
+    if err != nil {
+        _ = tx.Rollback()
+        return err
+    }
+    defer stmt.Close()
+
+    for _,subj := range subjects {
+        if _, err := stmt.Exec(subj.Name, subj.DotPath, subj.Parent, subj.IsTop); err != nil {
+            _ = tx.Rollback()
+            return err
+        }
+    }
+
+    if err := tx.Commit(); err != nil {
+        _ = tx.Rollback()
+        return err
+    }
+    // END ADD LIST TO DB
+
+    return nil
+    
+}
+
+
+func pull_papers(db *sql.DB, dotPath string) error {
+    resp, err := http.Get(ARXIV_RSS_URL + dotPath)
+    if err != nil {
+        return err
+    }
+    body, err := io.ReadAll(resp.Body)
+    resp.Body.Close()
+    if err != nil {
+        return err
+    }
+
+    var rss RSS
+
+    if err := xml.Unmarshal(body, &rss); err != nil {
+        return err
+    }
+
+    tx, err := db.Begin()
+    if err != nil {
+        return err
+    }
+    
+    // query to insert a new paper
+    insertNewPaper, err := tx.Prepare(`
+        INSERT OR IGNORE INTO papers (arxiv_id, guid, title, description, pub_date, creator)
+        VALUES (?, ?, ?, ?, ?, ?)
+        RETURNING id`)
+    if err != nil {
+        _ = tx.Rollback()
+        return err
+    }
+    defer insertNewPaper.Close()
+    
+    
+    // query to get the category id based on dotpath
+    selectCategoryID, err := tx.Prepare(`SELECT id FROM categories WHERE dot_path = ?`)
+    if err != nil {
+        _ = tx.Rollback()
+        return err
+    }
+    defer selectCategoryID.Close()
+    
+    // query to insert paper category
+    insertPaperCategory, err := tx.Prepare(`
+        INSERT OR IGNORE INTO paper_categories (paper_id, category_id)
+        VALUES (?, ?)`)
+    if err != nil {
+        _ = tx.Rollback()
+        return err
+    }
+    defer insertPaperCategory.Close()
+    
+    seenCategories := make(map[string]int)
+    
+    for _, item := range rss.Channel.Items {
+        switch item.AnnounceType {
+        case "new":
+            arxivPrefixString := "arXiv:"
+            arxivIdStart := strings.Index(item.Description, arxivPrefixString) + len(arxivPrefixString)
+            space := strings.IndexRune(item.Description[arxivIdStart:], ' ') + arxivIdStart
+            if space <= 6 {
+                log.Println("bad description format for arXiv id:", item.Description)
+                continue
+            }
+            arxivId := item.Description[arxivIdStart:space]
+
+            abstractPrefixString := "Abstract: "
+            abstractStart := strings.Index(item.Description, abstractPrefixString) + len(abstractPrefixString)
+
+            t, err := time.Parse(RSS_TIME_LAYOUT_STR, item.PubDate)
+            if err != nil {
+                log.Println("ERROR PARSING TIME: ID: ", arxivId, " pubDate: ", item.PubDate)
+                t = time.Now()
+            }
+
+            item.PubDate = t.UTC().Format(ISO_86O1_TIME_LAYOUT_STR)
+    
+            var paperId int
+            if err := insertNewPaper.QueryRow(
+                arxivId,
+                item.GUID.Value,
+                item.Title,
+                item.Description[abstractStart:],
+                item.PubDate,
+                item.DCCreator,
+            ).Scan(&paperId); err != nil {
+                if errors.Is(err, sql.ErrNoRows) {
+                    // INSERT was ignored, skip existing paper
+                    continue
+                } else {
+                    _ = tx.Rollback()
+                    return err
+                }
+            }
+    
+            for _, category := range item.Categories {
+                categoryId, exists := seenCategories[category]
+                if !exists {
+                    if err := selectCategoryID.QueryRow(category).Scan(&categoryId); err != nil {
+                        log.Println(category)
+                        log.Println(err)
+                        continue
+                    }
+
+                    seenCategories[category] = categoryId
+                }
+    
+                if _, err := insertPaperCategory.Exec(paperId, categoryId); err != nil {
+                    log.Println(err)
+                    continue
+                }
+            }
+        default:
+            // ignore
+        }
+    }
+    
+    if err := tx.Commit(); err != nil {
+        _ = tx.Rollback()
+        return err
+    }
+
+    return nil
+}
+
+
+func generateMissingEmbeddings(db *sql.DB) {
+    queryGetMissing := `
+        SELECT id, title, description FROM papers 
+        WHERE id NOT IN (
+            SELECT paper_id FROM papers_vec
+        )
+    `
+
+    row, err := db.Query(queryGetMissing)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer row.Close()
+
+    
+    paperIds := []uint64{} 
+    toEmbed := []string{}
+    for row.Next() {
+        var paperId uint64
+        var title string
+        var description string
+        
+        err = row.Scan(&paperId, &title, &description)
+        if err != nil {
+            log.Println(err)
+            continue
+        }
+
+        paperIds = append(paperIds, paperId)
+        toEmbed = append(toEmbed, title + "\n" + description)
+    }
+
+
+    embeds := [][EMBED_DIM]float32{}
+    chunkSize := 10
+    if len(paperIds) > chunkSize {
+        fmt.Printf("\nToo many embeddings (%d), generating in chunks (%d): \n", len(paperIds), chunkSize)
+        for i := 0; i < len(paperIds); i+=chunkSize {
+            fmt.Printf("\r%3d%%", 100 * i / len(paperIds))
+            chunkEmbeds := ollamaEmbed(toEmbed[i: i+chunkSize])
+            embeds = append(embeds, chunkEmbeds...)
+        }
+        fmt.Printf("\r%3d%%\n", 100)
+    } else {
+        fmt.Printf("Generating %d embeddings... ", len(paperIds))
+        embeds = ollamaEmbed(toEmbed)
+    }
+    log.Println("Done.")
+
+    tx, err := db.Begin()
+    if err != nil {
+        log.Fatal(err)
+    }
+    
+    // query to insert a new paper
+    insertNewEmbedding, err := tx.Prepare(`
+        INSERT INTO papers_vec (paper_id, embedding) VALUES (?, ?)
+    `)
+    if err != nil {
+        _ = tx.Rollback()
+        log.Fatal(err)
+    }
+    defer insertNewEmbedding.Close()
+
+    for i, paperId := range paperIds {
+        embedSerial, err := sqlite_vec.SerializeFloat32(embeds[i][:])
+        if err != nil {
+            _ = tx.Rollback()
+            log.Fatal(err)
+        }
+        if _, err := insertNewEmbedding.Exec(paperId, embedSerial); err != nil {
+            _ = tx.Rollback()
+            log.Fatal(err)
+        }
+        
+    }
+
+    if err := tx.Commit(); err != nil {
+        _ = tx.Rollback()
+        log.Fatal(err)
+    }
+
+}
+
+
+func keywordSearch(db *sql.DB, posWords string, negWords string, limit int) ([]PaperResult) {
+    query := `
+    WITH 
+    pos AS 
+        (SELECT rowid, bm25(papers_fts, 0.0, 1.0) AS score
+            FROM papers_fts
+            WHERE papers_fts MATCH :pos_words),
+    neg AS 
+        (SELECT pos.rowid, bm25(papers_fts, 0.0, 1.0) AS score
+            FROM pos JOIN papers_fts ON pos.rowid = papers_fts.rowid
+            WHERE :neg_words <> '' AND papers_fts MATCH :neg_words )
+    SELECT p.arxiv_id, p.title, p.description, pos.score - :neg_weight * COALESCE(1.0 / (neg.score + 1e-9), 0.0) as final_score
+        FROM pos 
+        LEFT JOIN neg ON pos.rowid = neg.rowid 
+        JOIN papers p ON pos.rowid = p.id
+        ORDER BY final_score LIMIT :limit;
+    `
+    rows, err := db.Query(query, 
+        sql.Named("pos_words", posWords),
+        sql.Named("neg_words", negWords),
+        sql.Named("neg_weight", 50),
+        sql.Named("limit", limit),
+    )
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer rows.Close()
+    res := make([]PaperResult, limit)
+    i := 0
+    for rows.Next() {
+        if err := rows.Scan(&res[i].ArxivId, &res[i].Title, &res[i].Desc, &res[i].Score); err != nil {
+            log.Fatal(err)
+        }
+        i++
+    }
+
+
+    if err := rows.Err(); err != nil {
+        log.Fatal(err)
+    }
+    
+    return res
+}
+
+
+func embedStringSearch(db *sql.DB, toEmbed string, limit int) ([]PaperResult) {
+    embedVec := ollamaEmbed([]string{toEmbed})[0]
+
+    queryVec,err := sqlite_vec.SerializeFloat32(embedVec[:])
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    rows,err := db.Query(`
+        SELECT arxiv_id, title, description, distance
+        FROM papers JOIN (
+            SELECT paper_id, distance FROM papers_vec
+            WHERE embedding MATCH ? 
+            LIMIT ?
+        ) ON papers.id = paper_id
+        ORDER BY distance
+    `, queryVec, limit)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer rows.Close()
+
+
+    res := make([]PaperResult, limit)    
+    i := 0
+    for rows.Next() {
+        if err := rows.Scan(&res[i].ArxivId, &res[i].Title, &res[i].Desc, &res[i].Score); err != nil {
+            log.Fatal(err)
+        }
+        i++
+    } 
+
+    return res
+}
+
+
+func main() {
+    log.SetFlags(log.Lshortfile)
+
+    sqlite_vec.Auto()
+    db, err := sql.Open("sqlite3", "./app.db")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer db.Close()
+
+    shouldRefreshSubjectsPtr := flag.Bool("s", false, "Pull the latest subjects (e.g. Physics) from arxiv. Should rarely, if ever, be needed after the first run.")
+    shouldPullPapersPtr := flag.Bool("p", false, "Pull todays papers from arxiv. Should be run daily.")
+    shouldEmbedPtr := flag.Bool("e", false, "Generate embeddings for all the papers in the db that don't already have them. This can be quite slow. Papers without embeddings will not be returned by vector queries.")
+    shouldKeywordSearchPtr := flag.Bool("k", false, "Search on keywords using bm25. Can have two string inputs (1) POSITIVE and (2) NEGATIVE keywords. Use word1 OR word2 for union of terms.")
+    shouldVectorSearchPtr := flag.Bool("v", false, "Search on vector embeddings. Use a string similar to the kind of paper you want to see. E.g. 'New attention mechanism in transformers.'")
+    numResultsPtr := flag.Int("n", 5, "Number of results to return for the query.")
+
+    flag.Parse()
+
+    numResults := *numResultsPtr
+
+
+    if *shouldRefreshSubjectsPtr {
+        RefreshSubjects(db)
+    }
+
+    // Pull todays papers from top level subjects
+    if *shouldPullPapersPtr {
+        rows, err := db.Query("SELECT name, dot_path FROM categories WHERE is_top=true", nil)
+        if err != nil {
+            log.Fatal(err)
+        }
+        defer rows.Close()
+
+        subjNames := []string{}
+        subjDotPaths := []string{}
+        for rows.Next() {
+            var name string
+            var dotPath string
+            if err := rows.Scan(&name, &dotPath); err != nil {
+                log.Fatal(err)
+            }
+
+            subjNames = append(subjNames, name)
+            subjDotPaths = append(subjDotPaths, dotPath)
+        }
+
+        for _,subjPath := range subjDotPaths {
+            err := pull_papers(db, subjPath)
+            if err != nil {
+                log.Println(err)
+            }
+        }
+    }
+
+    if *shouldEmbedPtr {
+        generateMissingEmbeddings(db)
+    }
+
+
+    searchStr := flag.Arg(0)
+    var negStr string
+    if flag.NArg() != 2 {
+        fmt.Printf("No negative given, assuming blank.\n")
+        negStr = ""
+    } else {
+        negStr = flag.Arg(1)
+    }
+    
+    if *shouldKeywordSearchPtr {
+        res := keywordSearch(db, searchStr, negStr, numResults)
+        fmt.Printf("Keyword search results:\n")
+        for _,v := range res {
+            fmt.Printf("%s (%s): %.3f\n", v.Title, v.ArxivId, v.Score)
+        }
+        fmt.Printf("\n")
+    }
+
+    if *shouldVectorSearchPtr {
+        fmt.Printf("Vector search results:\n")
+        res := embedStringSearch(db, searchStr, numResults)
+        for _,v := range res {
+            fmt.Printf("%s (%s): %.3f\n", v.Title, v.ArxivId, v.Score)
+        }
+        fmt.Printf("\n")
+    }
+}
