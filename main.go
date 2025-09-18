@@ -5,6 +5,7 @@ import (
     "errors"
     "flag"
     "fmt"
+    "html/template"
     "log"
     "io"
     "encoding/xml"
@@ -17,6 +18,7 @@ import (
     "database/sql"
     sqlite_vec "github.com/asg017/sqlite-vec-go-bindings/cgo"
     _ "github.com/mattn/go-sqlite3"
+
 )
 
 
@@ -188,7 +190,7 @@ func ollamaEmbed(toEmbed []string) ([][EMBED_DIM]float32) {
 
 
 
-func RefreshSubjects(db *sql.DB) error {
+func refreshSubjects(db *sql.DB) error {
     base := "http://export.arxiv.org/oai2"
     verb := "ListSets"
 
@@ -278,7 +280,7 @@ func RefreshSubjects(db *sql.DB) error {
 }
 
 
-func pull_papers(db *sql.DB, dotPath string) error {
+func pullPapers(db *sql.DB, dotPath string) error {
     resp, err := http.Get(ARXIV_RSS_URL + dotPath)
     if err != nil {
         return err
@@ -391,7 +393,7 @@ func pull_papers(db *sql.DB, dotPath string) error {
                 }
             }
         default:
-            // ignore
+            // ignore e.g. updates
         }
     }
     
@@ -534,7 +536,7 @@ func keywordSearch(db *sql.DB, posWords string, negWords string, limit int) ([]P
 }
 
 
-func embedStringSearch(db *sql.DB, toEmbed string, limit int) ([]PaperResult) {
+func semanticStringSearch(db *sql.DB, toEmbed string, limit int) ([]PaperResult) {
     embedVec := ollamaEmbed([]string{toEmbed})[0]
 
     queryVec,err := sqlite_vec.SerializeFloat32(embedVec[:])
@@ -570,6 +572,37 @@ func embedStringSearch(db *sql.DB, toEmbed string, limit int) ([]PaperResult) {
 }
 
 
+
+func pullAllNewPapers(db *sql.DB) error {
+    rows, err := db.Query("SELECT name, dot_path FROM categories WHERE is_top=true", nil)
+    if err != nil {
+        return err
+    }
+    defer rows.Close()
+
+    subjNames := []string{}
+    subjDotPaths := []string{}
+    for rows.Next() {
+        var name string
+        var dotPath string
+        if err := rows.Scan(&name, &dotPath); err != nil {
+            return err
+        }
+
+        subjNames = append(subjNames, name)
+        subjDotPaths = append(subjDotPaths, dotPath)
+    }
+
+    for _,subjPath := range subjDotPaths {
+        err := pullPapers(db, subjPath)
+        if err != nil {
+            return err
+        }
+    }
+    return nil
+}
+
+
 func main() {
     log.SetFlags(log.Lshortfile)
 
@@ -593,35 +626,14 @@ func main() {
 
 
     if *shouldRefreshSubjectsPtr {
-        RefreshSubjects(db)
+        refreshSubjects(db)
     }
 
     // Pull todays papers from top level subjects
     if *shouldPullPapersPtr {
-        rows, err := db.Query("SELECT name, dot_path FROM categories WHERE is_top=true", nil)
+        err := pullAllNewPapers(db)
         if err != nil {
             log.Fatal(err)
-        }
-        defer rows.Close()
-
-        subjNames := []string{}
-        subjDotPaths := []string{}
-        for rows.Next() {
-            var name string
-            var dotPath string
-            if err := rows.Scan(&name, &dotPath); err != nil {
-                log.Fatal(err)
-            }
-
-            subjNames = append(subjNames, name)
-            subjDotPaths = append(subjDotPaths, dotPath)
-        }
-
-        for _,subjPath := range subjDotPaths {
-            err := pull_papers(db, subjPath)
-            if err != nil {
-                log.Println(err)
-            }
         }
     }
 
@@ -650,10 +662,103 @@ func main() {
 
     if *shouldVectorSearchPtr {
         fmt.Printf("Vector search results:\n")
-        res := embedStringSearch(db, searchStr, numResults)
+        res := semanticStringSearch(db, searchStr, numResults)
         for _,v := range res {
             fmt.Printf("%s (%s): %.3f\n", v.Title, v.ArxivId, v.Score)
         }
         fmt.Printf("\n")
     }
+
+   
+
+    // TODO port from args
+    port := "8080"
+
+    fs := http.FileServer(http.Dir("./static"))
+    http.Handle("/static/", http.StripPrefix("/static/", fs))
+
+    // TODO handle proxies gracefully
+    //tmpl := template.Must(template.ParseFiles("templates/index.html"))
+    //http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+    //    basePath := r.Header.Get("SCRIPT_NAME")
+
+    //    if basePath == "/" {
+    //        basePath = ""
+    //    }
+
+    //    data := TemplateData{
+    //        BasePath: basePath,
+    //    }
+
+    //    if err := tmpl.Execute(w, data); err != nil {
+    //        http.Error(w, err.Error(), http.StatusInternalServerError)
+    //    }
+    //})
+
+    tmpl := template.Must(template.ParseFiles("templates/index.html"))
+    http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+        if err := tmpl.ExecuteTemplate(w, "index", nil); err != nil {
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+        }
+    })
+
+
+    http.HandleFunc("/api/keyword-search", func (w http.ResponseWriter, r *http.Request) {
+        if err := r.ParseForm(); err != nil {
+            http.Error(w, "bad form", http.StatusBadRequest)
+		    return
+	    }
+        query := r.FormValue("searchQuery")
+        results := keywordSearch(db, query, "", 5)
+
+        if err := tmpl.ExecuteTemplate(w, "paperResults", results); err != nil {
+            log.Println(err.Error())
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+        }
+    })
+
+
+    http.HandleFunc("/api/semantic-search", func (w http.ResponseWriter, r *http.Request) {
+        if err := r.ParseForm(); err != nil {
+            http.Error(w, "bad form", http.StatusBadRequest)
+		    return
+	    }
+        query := r.FormValue("searchQuery")
+        results := semanticStringSearch(db, query, 5)
+
+        if err := tmpl.ExecuteTemplate(w, "paperResults", results); err != nil {
+            log.Println(err.Error())
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+        }
+    })
+
+
+    http.HandleFunc("/api/refresh-subjects", func (w http.ResponseWriter, r *http.Request) {
+        err := refreshSubjects(db)               
+        if err != nil {
+            log.Println(err.Error())
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
+        fmt.Fprintf(w, "Subjects Refreshed.")
+    })
+
+    http.HandleFunc("/api/pull-papers", func (w http.ResponseWriter, r *http.Request) {
+        err := pullAllNewPapers(db)               
+        if err != nil {
+            log.Println(err.Error())
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
+        fmt.Fprintf(w, "New papers pulled, only keyword search is available until the embeddings are generated.")
+    })
+
+
+
+
+    log.Println("Listening on port " + port)
+    if err := http.ListenAndServe(":" + port, nil); err != nil {
+        log.Fatal(err)
+    }
+
 }

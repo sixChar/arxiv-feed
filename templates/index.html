@@ -1,0 +1,60 @@
+{{ define "index" }}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Arxiv Feed</title>
+  <script src="/static/htmx.min.js"></script>
+  <style>
+  </style>
+</head>
+<body>
+  <div>
+    <div>
+        <button 
+            hx-get="/api/refresh-subjects"
+            hx-target="#queryResult"
+            hx-swap="innerHTML"
+        >Refresh Subject List</button>
+
+        <button
+            hx-get="/api/pull-papers"
+            hx-target="#queryResult"
+            hx-swap="innerHTML"
+        >Pull Papers</button>
+    </div>
+
+    <form 
+        hx-get="/api/keyword-search" 
+        hx-target="#queryResult"
+        hx-swap="innerHTML"
+    >
+        <textarea name="searchQuery" rows=4 cols=100 placeholder="Keywords to search for. E.g. &quot;Machine Learning&quot; OR AI"></textarea>
+        <input type="submit" value="Keyword search">
+    </form>
+
+    <form
+        hx-get="/api/semantic-search" 
+        hx-target="#queryResult"
+        hx-swap="innerHTML"
+    >
+        <textarea name="searchQuery" rows=4 cols=100 placeholder="Style of article to search for. E.g. Survey of recent advances in machine learning."></textarea>
+        <input type="submit" value="Semantic search">
+    </form>
+    <div id="queryResult">...</div>
+  </div>
+</body>
+</html>
+{{ end }}
+
+
+{{ define "paperResults" }}
+{{ range . }}
+    <div>
+      <h2><a href="https://arxiv.org/abs/{{.ArxivId}}" target="_blank">{{.Title}}</a></h2>
+      <p><em>Published: {{.PubDate}}</em></p>
+      <p>{{.Desc}}</p>
+      <p>Score: {{printf "%.3f" .Score}}</p>
+    </div>
+  {{ end }}
+{{ end }}
