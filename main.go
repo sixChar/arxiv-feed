@@ -2,11 +2,13 @@ package main
 
 import (
     "bytes"
+    "context"
     "errors"
     "flag"
     "fmt"
     "html/template"
     "log"
+    "os"
     "io"
     "encoding/xml"
     "encoding/json"
@@ -17,8 +19,12 @@ import (
 
     "database/sql"
     sqlite_vec "github.com/asg017/sqlite-vec-go-bindings/cgo"
-    _ "github.com/mattn/go-sqlite3"
+    sqlite3 "github.com/mattn/go-sqlite3"
 
+    "golang.org/x/crypto/bcrypt"
+
+    "github.com/golang-jwt/jwt/v5"
+    "github.com/joho/godotenv"
 )
 
 
@@ -32,6 +38,10 @@ const EMBED_MODEL = "nomic-embed-text:v1.5"
 const EMBED_URL = "http://127.0.0.1:11434/api/embed"
 const EMBED_DIM = 768
 
+var JWT_KEY []byte
+
+const USER_ID_CONTEXT_KEY = "userId"
+const BCRYPT_STRENGTH = 14
 
 
 type OAI struct {
@@ -184,9 +194,6 @@ func ollamaEmbed(toEmbed []string) ([][EMBED_DIM]float32) {
     
     return res.Embeddings
 }
-
-
-
 
 
 
@@ -603,6 +610,88 @@ func pullAllNewPapers(db *sql.DB) error {
 }
 
 
+///--- BEGIN auth ---///
+type JWTClaims struct {
+    UserId uint64 `json:"userid"`
+    jwt.RegisteredClaims
+}
+
+func createAndSetToken(w http.ResponseWriter, userId uint64) error {
+
+    expirationTime := time.Now().Add(8 * time.Hour)
+    claims := &JWTClaims{
+        UserId: userId,
+        RegisteredClaims: jwt.RegisteredClaims{
+            ExpiresAt: jwt.NewNumericDate(expirationTime),
+            IssuedAt:  jwt.NewNumericDate(time.Now()),
+            NotBefore: jwt.NewNumericDate(time.Now()),
+        },
+    }
+
+    token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+    tokenStr, err := token.SignedString(JWT_KEY)
+    if err != nil {
+        return fmt.Errorf("Error signing token string: %v", err)
+    }
+
+    http.SetCookie(w, &http.Cookie{
+        Name:     "token",
+        Value:    tokenStr,
+        Expires:  expirationTime,
+        HttpOnly: true,
+        Path: "/",
+        // Secure: true TODO when https set up
+    })
+
+    return nil
+}   
+
+
+func redirect(w http.ResponseWriter, r *http.Request, redirectURL string) {
+    if r.Header.Get("HX-Request") == "true" {
+        w.Header().Set("HX-Redirect", redirectURL)
+        w.WriteHeader(http.StatusOK)
+        return
+    }
+    http.Redirect(w, r, redirectURL, http.StatusSeeOther)
+}
+
+
+func authenticate(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        cookie, err := r.Cookie("token")
+        if err != nil {
+            redirect(w, r, "/login")
+            return
+        }
+
+        ///--- verify jwt ---///
+        claims := &JWTClaims{}
+
+        token, err := jwt.ParseWithClaims(cookie.Value, claims, func(token *jwt.Token) (interface{}, error) {
+            if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+                return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
+            }
+            return JWT_KEY, nil
+        })
+
+        if err != nil {
+            log.Println(err.Error())
+            redirect(w, r, "/login")
+            return
+        }
+        
+        if !token.Valid {
+            log.Println("invalid token")
+            redirect(w, r, "/login")
+            return
+        }
+        
+        ctx := context.WithValue(r.Context(), USER_ID_CONTEXT_KEY, uint64(claims.UserId))
+        next.ServeHTTP(w,r.WithContext(ctx))
+    })
+}
+
 func main() {
     log.SetFlags(log.Lshortfile)
 
@@ -613,12 +702,22 @@ func main() {
     }
     defer db.Close()
 
+
+    err = godotenv.Load()
+    if err != nil {
+        log.Fatal(err)
+    }
+    JWT_KEY = []byte(os.Getenv("JWT_SECRET_KEY"))
+    
+
     shouldRefreshSubjectsPtr := flag.Bool("s", false, "Pull the latest subjects (e.g. Physics) from arxiv. Should rarely, if ever, be needed after the first run.")
-    shouldPullPapersPtr := flag.Bool("p", false, "Pull todays papers from arxiv. Should be run daily.")
-    shouldEmbedPtr := flag.Bool("e", false, "Generate embeddings for all the papers in the db that don't already have them. This can be quite slow. Papers without embeddings will not be returned by vector queries.")
+    shouldPullPapersPtr := flag.Bool("pull", false, "Pull todays papers from arxiv. Should be run daily.")
+    shouldEmbedPtr := flag.Bool("embed", false, "Generate embeddings for all the papers in the db that don't already have them. This can be quite slow. Papers without embeddings will not be returned by vector queries.")
     shouldKeywordSearchPtr := flag.Bool("k", false, "Search on keywords using bm25. Can have two string inputs (1) POSITIVE and (2) NEGATIVE keywords. Use word1 OR word2 for union of terms.")
     shouldVectorSearchPtr := flag.Bool("v", false, "Search on vector embeddings. Use a string similar to the kind of paper you want to see. E.g. 'New attention mechanism in transformers.'")
     numResultsPtr := flag.Int("n", 5, "Number of results to return for the query.")
+    portPtr := flag.String("p", "8080", "Port to run the server on.")
+    noServerPtr := flag.Bool("ns", false, "Set to not run the server. (i.e. only run the commands given by other flags)")
 
     flag.Parse()
 
@@ -669,10 +768,14 @@ func main() {
         fmt.Printf("\n")
     }
 
-   
+
+    if *noServerPtr {
+        return
+    }
 
     // TODO port from args
-    port := "8080"
+    port := *portPtr
+
 
     fs := http.FileServer(http.Dir("./static"))
     http.Handle("/static/", http.StripPrefix("/static/", fs))
@@ -702,6 +805,111 @@ func main() {
         }
     })
 
+
+    http.HandleFunc("/signup", func(w http.ResponseWriter, r *http.Request) {
+        if err := tmpl.ExecuteTemplate(w, "signup", nil); err != nil {
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+        }
+    })
+
+
+    http.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
+        if err := tmpl.ExecuteTemplate(w, "login", nil); err != nil {
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+        }
+    })
+
+
+    http.HandleFunc("/api/signup", func(w http.ResponseWriter, r *http.Request) {
+        email := r.FormValue("email")
+        password := r.FormValue("password")
+        passConf := r.FormValue("passConf")
+
+        if password != passConf {
+            http.Error(w, "Passwords do not match", http.StatusUnprocessableEntity)
+        }
+
+        phash, err := bcrypt.GenerateFromPassword([]byte(password), BCRYPT_STRENGTH)
+
+        if err != nil {
+            log.Println(err.Error())
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return 
+        }
+
+        query := `
+            INSERT INTO users (email, phash)
+            VALUES (?, ?)
+        `
+
+        var userId uint64
+        res, err := db.ExecContext(r.Context(), query, email, phash)
+        if err != nil {
+          var sqlErr sqlite3.Error
+          if errors.As(err, &sqlErr) && (sqlErr.Code == sqlite3.ErrConstraint || sqlErr.ExtendedCode == sqlite3.ErrConstraintUnique) {
+            log.Println("Email already exists")
+            redirect(w, r, "/login")
+            return
+          }
+          log.Println(err.Error())
+          http.Error(w, err.Error(), http.StatusInternalServerError)
+          return
+        }
+
+        lastId, err := res.LastInsertId()
+        if err != nil {
+            log.Println(err.Error())
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+            return
+        }
+        userId = uint64(lastId)
+
+
+        err = createAndSetToken(w, userId)
+        if err != nil {
+            log.Println(err.Error())
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+        }
+        
+        redirect(w,r,"/")
+    })
+
+
+    http.HandleFunc("/api/login", func(w http.ResponseWriter, r *http.Request) {
+        email := r.FormValue("email")
+        password := r.FormValue("password")
+
+        var userId uint64
+        var phash string
+
+        query := "SELECT id, phash FROM users WHERE email = $1"
+
+        err := db.QueryRowContext(r.Context(), query, email).Scan(&userId, &phash)
+        if err != nil {
+            if err == sql.ErrNoRows {
+                redirect(w, r, "/signup")
+            } else {
+                log.Println(err.Error())
+                http.Error(w, err.Error(), http.StatusInternalServerError)
+            }
+            return
+        }
+
+
+        err = bcrypt.CompareHashAndPassword([]byte(phash), []byte(password))
+        if err != nil {
+            if errors.Is(err, bcrypt.ErrMismatchedHashAndPassword) {
+                log.Println("Passwords don't match")
+                http.Error(w, err.Error(), http.StatusUnauthorized)
+                return
+            }
+            log.Println(err.Error())
+            http.Error(w, err.Error(), http.StatusInternalServerError)
+        }
+
+        createAndSetToken(w, userId)
+        redirect(w, r, "/")
+    })
 
     http.HandleFunc("/api/keyword-search", func (w http.ResponseWriter, r *http.Request) {
         if err := r.ParseForm(); err != nil {

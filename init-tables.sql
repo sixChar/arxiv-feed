@@ -2,6 +2,13 @@ PRAGMA foreign_keys=ON;
 
 SELECT load_extension('./vec0.so');
 
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE,
+    phash BLOB NOT NULL,
+    added TIMESTAMP DEFAULT current_timestamp
+);
+
 CREATE TABLE IF NOT EXISTS categories (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,

@@ -1,3 +1,5 @@
 *.db
 *.so
+.env
+*.swp
 

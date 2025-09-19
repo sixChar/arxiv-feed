@@ -1,14 +1,24 @@
-{{ define "index" }}
-<!doctype html>
+{{ define "baseHead" }}
+<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Arxiv Feed</title>
+  <title>{{ . }}</title>
   <script src="/static/htmx.min.js"></script>
   <style>
   </style>
 </head>
 <body>
+{{end}}
+
+{{ define "baseFoot" }}
+</body>
+</html>
+{{ end }}
+
+
+{{ define "index" }}
+  {{ with "Arxiv Feed"}}{{template "baseHead" .}}{{ end }}
   <div>
     <div>
         <button 
@@ -43,8 +53,7 @@
     </form>
     <div id="queryResult">...</div>
   </div>
-</body>
-</html>
+{{ template "baseFoot" . }}
 {{ end }}
 
 
@@ -58,3 +67,36 @@
     </div>
   {{ end }}
 {{ end }}
+
+
+{{define "signup"}}
+{{ with "Signup"}}{{template "baseHead" .}}{{ end }}
+<form hx-post="/api/signup">
+    <label for="email">Email</label>
+    <input id="email" name="email" type="email" placeholder="someone@example.com">
+
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" placeholder="******">
+
+    <label for="password">Confirm Password</label>
+    <input id="passConf" name="passConf" type="password" placeholder="******">
+
+    <input type="submit" value="Sign Up">
+</form>
+{{template "baseFoot" . }}
+{{end}}
+
+
+{{define "login"}}
+{{ with "Login"}}{{template "baseHead" .}}{{ end }}
+<form hx-post="/api/login">
+    <label for="email">Email</label>
+    <input id="email" name="email" type="email" placeholder="someone@example.com">
+
+    <label for="password">Password</label>
+    <input id="password" name="password" type="password" placeholder="******">
+
+    <input type="submit" value="Login">
+</form>
+{{template "baseFoot" . }}
+{{end}}
