@@ -39,6 +39,7 @@ const EMBED_URL = "http://127.0.0.1:11434/api/embed"
 const EMBED_DIM = 768
 
 var JWT_KEY []byte
+var TOGETHER_TOKEN string
 
 const USER_ID_CONTEXT_KEY = "userId"
 const BCRYPT_STRENGTH = 14
@@ -131,8 +132,12 @@ type PaperResult struct {
     Score float32
 }
 
+type EmbeddingRequest struct {
+    Model string `json:"model"`
+    Input []string `json:"input"`
+}
 
-func ollamaEmbed(toEmbed []string) ([][EMBED_DIM]float32) {
+func ollamaEmbed(toEmbed []string) ([][EMBED_DIM]float32, error) {
     toEmbedNomic := make([]string, len(toEmbed))
     prefix := "clustering: "
 
@@ -140,22 +145,19 @@ func ollamaEmbed(toEmbed []string) ([][EMBED_DIM]float32) {
         toEmbedNomic[i] = prefix + str
     }
 
-    reqBodyStruct := struct {
-        Model   string     `json:"model"`
-        Input  []string   `json:"input"`
-    }{
+    reqBodyStruct := EmbeddingRequest{
         Model: EMBED_MODEL,
         Input: toEmbedNomic,
     }
 
     reqBody, err := json.Marshal(reqBodyStruct)
     if err != nil {
-        log.Fatal(err)
+        return nil, err
     }
 
     req, err := http.NewRequest("POST", EMBED_URL, bytes.NewReader(reqBody))
     if err != nil {
-        log.Fatal(err)
+        return nil, err
     }
 
     req.Header.Set("Content-Type", "application/json")
@@ -164,16 +166,17 @@ func ollamaEmbed(toEmbed []string) ([][EMBED_DIM]float32) {
 
     resp, err := client.Do(req)
     if err != nil {
-        log.Fatal(err)
+        return nil, err
     }
     defer resp.Body.Close()
 
     respBody, err := io.ReadAll(resp.Body)
     if err != nil {
-        log.Fatal(err)
+        return nil, err
     }
     if (resp.StatusCode != http.StatusOK) {
-        log.Fatalf("Request error. Got status: %s\n%s\n", resp.StatusCode, respBody)
+        err := fmt.Errorf("Request error in ollamaEmbed. Got status: %s\n%s\n", resp.StatusCode, respBody)
+        return nil, err
     }
 
 
@@ -188,11 +191,70 @@ func ollamaEmbed(toEmbed []string) ([][EMBED_DIM]float32) {
 
     err = json.Unmarshal(respBody, &res)
     if err != nil {
-        log.Fatal(err)
+        return nil, err
     }
 
     
-    return res.Embeddings
+    return res.Embeddings, nil
+}
+
+
+func togetherEmbed(toEmbed []string) ([][EMBED_DIM]float32, error) {
+	url := "https://api.together.xyz/v1/embeddings"
+
+    // IF YOU CHANGE MODEL, BEWARE EMBED DIM
+    payload := EmbeddingRequest{
+        Model: "togethercomputer/m2-bert-80M-32k-retrieval",
+        Input: toEmbed,
+    }
+    body,_ := json.Marshal(payload)
+    
+    req,_ := http.NewRequest("POST", url, bytes.NewBuffer(body))
+    req.Header.Set("Authorization", "Bearer " + TOGETHER_TOKEN)
+    req.Header.Set("Content-Type", "application/json")
+
+    client := &http.Client{}
+    respRaw, err := client.Do(req)
+    if err != nil {
+        return nil, err
+    }
+    defer respRaw.Body.Close()
+
+    respBody, _ := io.ReadAll(respRaw.Body)
+
+    if respRaw.StatusCode != http.StatusOK {
+        err := fmt.Errorf("Status returned not ok in togetherEmbed: %s\nBody:\n%s", respRaw.StatusCode, respBody)
+        return nil, err
+	}
+
+    type EmbeddingData struct {
+        Embedding []float64 `json:"embedding"` // JSON numbers decoded as float64
+        Index     int       `json:"index"`
+        Object    string    `json:"object"`
+    }
+
+    type EmbeddingResponse struct {
+        Data  []EmbeddingData `json:"data"`
+        Model string          `json:"model"`
+    }
+    
+
+    var resp EmbeddingResponse
+    err = json.Unmarshal(respBody, &resp)
+    if err != nil {
+        return nil, err
+    }
+
+
+    embedding := make([][EMBED_DIM]float32, len(resp.Data))
+    for i, e := range resp.Data {
+        for j, val := range e.Embedding {
+            embedding[i][j] = float32(val)
+        }
+    }
+
+    return embedding,nil
+
 }
 
 
@@ -447,18 +509,28 @@ func generateMissingEmbeddings(db *sql.DB) {
 
 
     embeds := [][EMBED_DIM]float32{}
-    chunkSize := 10
+    chunkSize := 100
     if len(paperIds) > chunkSize {
-        fmt.Printf("\nToo many embeddings (%d), generating in chunks (%d): \n", len(paperIds), chunkSize)
+        fmt.Printf("\nToo many embeddings (%d), generating in chunks (%d) (may be very slow): \n", len(paperIds), chunkSize)
         for i := 0; i < len(paperIds); i+=chunkSize {
             fmt.Printf("\r%3d%%", 100 * i / len(paperIds))
-            chunkEmbeds := ollamaEmbed(toEmbed[i: i+chunkSize])
+            chunkEmbeds, err := togetherEmbed(toEmbed[i: i+chunkSize])
+            if err != nil {
+                log.Println(err.Error())
+                log.Println(i, i+chunkSize)
+                log.Println(toEmbed[i:i+chunkSize])
+                log.Println("Continuing...")
+                continue
+            }
             embeds = append(embeds, chunkEmbeds...)
         }
         fmt.Printf("\r%3d%%\n", 100)
     } else {
         fmt.Printf("Generating %d embeddings... ", len(paperIds))
-        embeds = ollamaEmbed(toEmbed)
+        embeds, err = togetherEmbed(toEmbed)
+        if err != nil {
+            log.Fatal(err)
+        }
     }
     log.Println("Done.")
 
@@ -544,9 +616,12 @@ func keywordSearch(db *sql.DB, posWords string, negWords string, limit int) ([]P
 
 
 func semanticStringSearch(db *sql.DB, toEmbed string, limit int) ([]PaperResult) {
-    embedVec := ollamaEmbed([]string{toEmbed})[0]
+    embedVec, err := togetherEmbed([]string{toEmbed})
+    if err != nil {
+        log.Fatal(err)
+    }
 
-    queryVec,err := sqlite_vec.SerializeFloat32(embedVec[:])
+    queryVec,err := sqlite_vec.SerializeFloat32(embedVec[0][:])
     if err != nil {
         log.Fatal(err)
     }
@@ -708,6 +783,7 @@ func main() {
         log.Fatal(err)
     }
     JWT_KEY = []byte(os.Getenv("JWT_SECRET_KEY"))
+    TOGETHER_TOKEN = os.Getenv("TOGETHER_TOKEN")
     
 
     shouldRefreshSubjectsPtr := flag.Bool("s", false, "Pull the latest subjects (e.g. Physics) from arxiv. Should rarely, if ever, be needed after the first run.")
