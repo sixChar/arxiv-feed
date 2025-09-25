@@ -38,6 +38,9 @@ const EMBED_MODEL = "nomic-embed-text:v1.5"
 const EMBED_URL = "http://127.0.0.1:11434/api/embed"
 const EMBED_DIM = 768
 
+// Chunk size to use for embedding large numbers at a time
+const CHUNK_SIZE = 32
+
 var JWT_KEY []byte
 var TOGETHER_TOKEN string
 
@@ -475,6 +478,53 @@ func pullPapers(db *sql.DB, dotPath string) error {
 }
 
 
+
+func writeEmbeds(db *sql.DB, paperIds []uint64, embeds [][EMBED_DIM]float32) error {
+/*
+    Write the embeddings for the given ids to the database
+*/
+    if len(paperIds) != len(embeds) {
+        return fmt.Errorf("PaperIds and embeds given to writeEmbeds must be the same length (%d vs %d)", len(paperIds), len(embeds))
+    }
+
+    tx, err := db.Begin()
+    if err != nil {
+        return err
+    }
+    
+    // query to insert a new paper
+    insertNewEmbedding, err := tx.Prepare(`
+        INSERT INTO papers_vec (paper_id, embedding) VALUES (?, ?)
+    `)
+    if err != nil {
+        _ = tx.Rollback()
+        return err
+    }
+    defer insertNewEmbedding.Close()
+
+    for i, paperId := range paperIds {
+        embedSerial, err := sqlite_vec.SerializeFloat32(embeds[i][:])
+        if err != nil {
+            _ = tx.Rollback()
+            return err
+        }
+        if _, err = insertNewEmbedding.Exec(paperId, embedSerial); err != nil {
+            _ = tx.Rollback()
+            return err
+        }
+        
+    }
+    
+
+    if err := tx.Commit(); err != nil {
+        _ = tx.Rollback()
+        return err
+    }
+
+    return nil
+}
+
+
 func generateMissingEmbeddings(db *sql.DB) {
     queryGetMissing := `
         SELECT id, title, description FROM papers 
@@ -508,64 +558,46 @@ func generateMissingEmbeddings(db *sql.DB) {
     }
 
 
-    embeds := [][EMBED_DIM]float32{}
-    chunkSize := 100
-    if len(paperIds) > chunkSize {
-        fmt.Printf("\nToo many embeddings (%d), generating in chunks (%d) (may be very slow): \n", len(paperIds), chunkSize)
-        for i := 0; i < len(paperIds); i+=chunkSize {
+    if len(paperIds) > CHUNK_SIZE * 2 {
+        fmt.Printf("\nToo many embeddings (%d), generating in chunks (%d) (may be very slow): \n", len(paperIds), CHUNK_SIZE)
+        for i := 0; i < len(paperIds); i+=CHUNK_SIZE {
+            chunkEnd := min(i + CHUNK_SIZE, len(paperIds))
             fmt.Printf("\r%3d%%", 100 * i / len(paperIds))
-            chunkEmbeds, err := togetherEmbed(toEmbed[i: i+chunkSize])
+            chunkEmbeds, err := togetherEmbed(toEmbed[i: chunkEnd])
             if err != nil {
                 log.Println(err.Error())
-                log.Println(i, i+chunkSize)
-                log.Println(toEmbed[i:i+chunkSize])
+                log.Println(i, chunkEnd)
+                log.Println(len(toEmbed[i:chunkEnd]))
                 log.Println("Continuing...")
                 continue
             }
-            embeds = append(embeds, chunkEmbeds...)
+
+            // write embeds each chunk
+            err = writeEmbeds(db, paperIds[i:chunkEnd], chunkEmbeds)
+            if err != nil {
+                log.Println(err.Error())
+                log.Println(i, chunkEnd)
+                log.Println(len(toEmbed[i:chunkEnd]))
+                log.Println("Continuing...")
+                continue
+            }
         }
         fmt.Printf("\r%3d%%\n", 100)
     } else {
         fmt.Printf("Generating %d embeddings... ", len(paperIds))
-        embeds, err = togetherEmbed(toEmbed)
+        embeds, err := togetherEmbed(toEmbed)
         if err != nil {
             log.Fatal(err)
+        }
+
+        err = writeEmbeds(db, paperIds, embeds)
+        if err != nil {
+            log.Println(toEmbed)
+            log.Println(err.Error())
         }
     }
     log.Println("Done.")
 
-    tx, err := db.Begin()
-    if err != nil {
-        log.Fatal(err)
-    }
-    
-    // query to insert a new paper
-    insertNewEmbedding, err := tx.Prepare(`
-        INSERT INTO papers_vec (paper_id, embedding) VALUES (?, ?)
-    `)
-    if err != nil {
-        _ = tx.Rollback()
-        log.Fatal(err)
-    }
-    defer insertNewEmbedding.Close()
-
-    for i, paperId := range paperIds {
-        embedSerial, err := sqlite_vec.SerializeFloat32(embeds[i][:])
-        if err != nil {
-            _ = tx.Rollback()
-            log.Fatal(err)
-        }
-        if _, err := insertNewEmbedding.Exec(paperId, embedSerial); err != nil {
-            _ = tx.Rollback()
-            log.Fatal(err)
-        }
-        
-    }
-
-    if err := tx.Commit(); err != nil {
-        _ = tx.Rollback()
-        log.Fatal(err)
-    }
 
 }
 
