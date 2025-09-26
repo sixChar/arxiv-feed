@@ -5,5 +5,5 @@ Tool to pull the latest papers from arxiv and make them available for vector and
 
 ## TODOs
 - Add negatives to embedding queries
-- Add generate missing embeddings button to webui? might just want to keep this as a commandline thing
 - Protect embedding query route
+- figure out if the semantic embeddings are actually any good (they seem to have gotten awful)

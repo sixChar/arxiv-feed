@@ -203,11 +203,14 @@ func ollamaEmbed(toEmbed []string) ([][EMBED_DIM]float32, error) {
 
 
 func togetherEmbed(toEmbed []string) ([][EMBED_DIM]float32, error) {
+    if len(toEmbed) == 0 {
+        return nil, fmt.Errorf("No strings given to embed. Length of toEmbed is 0.")
+    }
 	url := "https://api.together.xyz/v1/embeddings"
 
     // IF YOU CHANGE MODEL, BEWARE EMBED DIM
     payload := EmbeddingRequest{
-        Model: "togethercomputer/m2-bert-80M-32k-retrieval",
+        Model: "BAAI/bge-base-en-v1.5-vllm",
         Input: toEmbed,
     }
     body,_ := json.Marshal(payload)
@@ -661,8 +664,8 @@ func semanticStringSearch(db *sql.DB, toEmbed string, limit int) ([]PaperResult)
     rows,err := db.Query(`
         SELECT arxiv_id, title, description, distance
         FROM papers JOIN (
-            SELECT paper_id, distance FROM papers_vec
-            WHERE embedding MATCH ? 
+            SELECT paper_id, vec_distance_cosine(embedding, ?) as distance FROM papers_vec
+            ORDER BY distance
             LIMIT ?
         ) ON papers.id = paper_id
         ORDER BY distance
@@ -852,7 +855,6 @@ func main() {
     searchStr := flag.Arg(0)
     var negStr string
     if flag.NArg() != 2 {
-        fmt.Printf("No negative given, assuming blank.\n")
         negStr = ""
     } else {
         negStr = flag.Arg(1)
@@ -1034,7 +1036,7 @@ func main() {
     })
 
 
-    http.HandleFunc("/api/semantic-search", func (w http.ResponseWriter, r *http.Request) {
+    http.Handle("/api/semantic-search", authenticate(http.HandlerFunc(func (w http.ResponseWriter, r *http.Request) {
         if err := r.ParseForm(); err != nil {
             http.Error(w, "bad form", http.StatusBadRequest)
 		    return
@@ -1046,7 +1048,7 @@ func main() {
             log.Println(err.Error())
             http.Error(w, err.Error(), http.StatusInternalServerError)
         }
-    })
+    })))
 
 
     http.HandleFunc("/api/refresh-subjects", func (w http.ResponseWriter, r *http.Request) {
