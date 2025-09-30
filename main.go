@@ -563,20 +563,40 @@ func generateMissingEmbeddings(db *sql.DB) {
 
     if len(paperIds) > CHUNK_SIZE * 2 {
         fmt.Printf("\nToo many embeddings (%d), generating in chunks (%d) (may be very slow): \n", len(paperIds), CHUNK_SIZE)
+
+        tooBigEmbeds := []string{}
+        tooBigIds := []uint64{}
         for i := 0; i < len(paperIds); i+=CHUNK_SIZE {
             chunkEnd := min(i + CHUNK_SIZE, len(paperIds))
             fmt.Printf("\r%3d%%", 100 * i / len(paperIds))
             chunkEmbeds, err := togetherEmbed(toEmbed[i: chunkEnd])
+            chunkPaperIds := paperIds[i:chunkEnd]
             if err != nil {
+                // TODO make sure error is actually having too many tokens (currently assumed)
                 log.Println(err.Error())
                 log.Println(i, chunkEnd)
                 log.Println(len(toEmbed[i:chunkEnd]))
-                log.Println("Continuing...")
-                continue
+                
+                
+                chunkEmbeds = [][EMBED_DIM]float32{}
+                chunkPaperIds := []uint64{}
+                // embed one-by-one to find the strings that were too big
+                log.Println("Chunk has input(s) that is too big. Embedding one-by-one and isolating.")
+                for j,emb := range(toEmbed[i:chunkEnd]) {
+                    embVec, err := togetherEmbed([]string{emb})
+                    if err != nil {
+                        // TODO also check error is actually having too many tokens
+                        tooBigEmbeds = append(tooBigEmbeds, emb)
+                        tooBigIds = append(tooBigIds, paperIds[i+j])
+                        continue
+                    }
+                    chunkEmbeds = append(chunkEmbeds, embVec[0])
+                    chunkPaperIds = append(chunkPaperIds, paperIds[i+j])
+                }
             }
 
             // write embeds each chunk
-            err = writeEmbeds(db, paperIds[i:chunkEnd], chunkEmbeds)
+            err = writeEmbeds(db, chunkPaperIds, chunkEmbeds)
             if err != nil {
                 log.Println(err.Error())
                 log.Println(i, chunkEnd)
@@ -584,19 +604,111 @@ func generateMissingEmbeddings(db *sql.DB) {
                 log.Println("Continuing...")
                 continue
             }
+ 
         }
+
+        // Deal with too big embeds
+        finishedEmbeds := [][EMBED_DIM]float32{}
+        finishedIds := []uint64{}
+        for len(tooBigEmbeds) > 0 {
+            log.Printf("Dealing with too bigs (%d)\n", len(tooBigEmbeds))
+
+            stillBigEmbeds := []string{}
+            stillBigIds := []uint64{}
+            for i, tooBig := range tooBigEmbeds {
+                // truncate by 10%
+                tooBig = tooBig[:len(tooBig) - len(tooBig) / 10]
+
+                embVec,err := togetherEmbed([]string{tooBig})
+                if err != nil {
+                    // TODO also check error is actually having too many tokens
+                    stillBigEmbeds = append(stillBigEmbeds, tooBig)
+                    stillBigIds = append(stillBigIds, tooBigIds[i])
+                    continue
+                }
+                finishedEmbeds = append(finishedEmbeds, embVec[0])
+                finishedIds = append(finishedIds, tooBigIds[i])
+                
+            }
+            tooBigEmbeds = stillBigEmbeds
+            tooBigIds = stillBigIds
+        }
+
+
+        // Write truncated embeds
+        err = writeEmbeds(db, finishedIds, finishedEmbeds)
+        if err != nil {
+            log.Println(err.Error())
+            log.Println("Continuing...")
+        }
+        
         fmt.Printf("\r%3d%%\n", 100)
     } else {
         fmt.Printf("Generating %d embeddings... ", len(paperIds))
+        goodPaperIds := paperIds
         embeds, err := togetherEmbed(toEmbed)
+        tooBigEmbeds := []string{}
+        tooBigIds := []uint64{}
+        goodEmbeds := [][EMBED_DIM]float32{}
+        goodPaperIds = []uint64{}
         if err != nil {
-            log.Fatal(err)
+            // TODO make sure error is actually having too many tokens (currently assumed)
+            log.Println(err.Error())
+
+            for j,emb := range(toEmbed) {
+                embVec, err := togetherEmbed([]string{emb})
+                if err != nil {
+                    // TODO also check error is actually having too many tokens
+                    tooBigEmbeds = append(tooBigEmbeds, emb)
+                    tooBigIds = append(tooBigIds, paperIds[j])
+                    continue
+                }
+                goodEmbeds = append(goodEmbeds, embVec[0])
+                goodPaperIds = append(goodPaperIds, paperIds[j])
+            }
+
+            embeds = goodEmbeds
         }
 
-        err = writeEmbeds(db, paperIds, embeds)
+        err = writeEmbeds(db, goodPaperIds, embeds)
         if err != nil {
             log.Println(toEmbed)
             log.Println(err.Error())
+        }
+
+        // Deal with too big embeds
+        finishedEmbeds := [][EMBED_DIM]float32{}
+        finishedIds := []uint64{}
+        for len(tooBigEmbeds) > 0 {
+            log.Printf("Dealing with too bigs (%d)\n", len(tooBigEmbeds))
+
+            stillBigEmbeds := []string{}
+            stillBigIds := []uint64{}
+            for i, tooBig := range tooBigEmbeds {
+                // truncate by 10%
+                tooBig = tooBig[:len(tooBig) - len(tooBig) / 10]
+
+                embVec,err := togetherEmbed([]string{tooBig})
+                if err != nil {
+                    // TODO also check error is actually having too many tokens
+                    stillBigEmbeds = append(stillBigEmbeds, tooBig)
+                    stillBigIds = append(stillBigIds, tooBigIds[i])
+                    continue
+                }
+                finishedEmbeds = append(finishedEmbeds, embVec[0])
+                finishedIds = append(finishedIds, tooBigIds[i])
+                
+            }
+            tooBigEmbeds = stillBigEmbeds
+            tooBigIds = stillBigIds
+        }
+
+
+        // Write truncated embeds
+        err = writeEmbeds(db, finishedIds, finishedEmbeds)
+        if err != nil {
+            log.Println(err.Error())
+            log.Println("Continuing...")
         }
     }
     log.Println("Done.")

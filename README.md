@@ -6,4 +6,5 @@ Tool to pull the latest papers from arxiv and make them available for vector and
 ## TODOs
 - Add negatives to embedding queries
 - Protect embedding query route
-- figure out if the semantic embeddings are actually any good (they seem to have gotten awful)
+- Merge codepaths in "tooBig" handling
+- Check whether the error returned from together ai is actually too many tokens
