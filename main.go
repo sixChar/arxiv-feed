@@ -14,6 +14,8 @@ import (
     "encoding/json"
     "net/http"
     "net/url"
+    "regexp"
+    "strconv"
     "strings"
     "time"
 
@@ -202,6 +204,18 @@ func ollamaEmbed(toEmbed []string) ([][EMBED_DIM]float32, error) {
 }
 
 
+type TooManyInputTokensError struct {
+    MaxTokens    int
+    InputTokens int
+}
+
+func (e *TooManyInputTokensError) Error() string {
+    return fmt.Sprintf("Input has too many tokens. Context length is %d but input had %d tokens.", e.MaxTokens, e.InputTokens)
+}
+
+var tooManyInputTokensRegEx = regexp.MustCompile(`maximum context length is (\d+) tokens.*requested (\d+) tokens`) 
+
+
 func togetherEmbed(toEmbed []string) ([][EMBED_DIM]float32, error) {
     if len(toEmbed) == 0 {
         return nil, fmt.Errorf("No strings given to embed. Length of toEmbed is 0.")
@@ -229,7 +243,19 @@ func togetherEmbed(toEmbed []string) ([][EMBED_DIM]float32, error) {
     respBody, _ := io.ReadAll(respRaw.Body)
 
     if respRaw.StatusCode != http.StatusOK {
-        err := fmt.Errorf("Status returned not ok in togetherEmbed: %s\nBody:\n%s", respRaw.StatusCode, respBody)
+        tooManyMatch := tooManyInputTokensRegEx.FindStringSubmatch(string(respBody))
+        if len(tooManyMatch) != 3 {
+            err := fmt.Errorf("Status returned not ok in togetherEmbed: %d\nBody:\n%s", respRaw.StatusCode, respBody)
+            return nil, err
+        }
+        maxTok, _ := strconv.Atoi(tooManyMatch[1])
+        inpTok, _ := strconv.Atoi(tooManyMatch[2])
+
+        err := &TooManyInputTokensError{
+            MaxTokens: maxTok,
+            InputTokens: inpTok,
+        }
+
         return nil, err
 	}
 
@@ -572,22 +598,26 @@ func generateMissingEmbeddings(db *sql.DB) {
             chunkEmbeds, err := togetherEmbed(toEmbed[i: chunkEnd])
             chunkPaperIds := paperIds[i:chunkEnd]
             if err != nil {
-                // TODO make sure error is actually having too many tokens (currently assumed)
-                log.Println(err.Error())
-                log.Println(i, chunkEnd)
-                log.Println(len(toEmbed[i:chunkEnd]))
-                
+                // Check if error NOT too many tokens
+                if _,ok := err.(*TooManyInputTokensError); !ok {
+                    log.Println(err.Error())
+                    continue
+                } 
                 
                 chunkEmbeds = [][EMBED_DIM]float32{}
-                chunkPaperIds := []uint64{}
+                chunkPaperIds = []uint64{}
                 // embed one-by-one to find the strings that were too big
                 log.Println("Chunk has input(s) that is too big. Embedding one-by-one and isolating.")
                 for j,emb := range(toEmbed[i:chunkEnd]) {
                     embVec, err := togetherEmbed([]string{emb})
                     if err != nil {
-                        // TODO also check error is actually having too many tokens
-                        tooBigEmbeds = append(tooBigEmbeds, emb)
-                        tooBigIds = append(tooBigIds, paperIds[i+j])
+                        // check if too many tokens
+                        if _,ok := err.(*TooManyInputTokensError); ok {
+                            tooBigEmbeds = append(tooBigEmbeds, emb)
+                            tooBigIds = append(tooBigIds, paperIds[i+j])
+                        } else { 
+                            log.Println(err.Error())
+                        }
                         continue
                     }
                     chunkEmbeds = append(chunkEmbeds, embVec[0])
@@ -621,9 +651,13 @@ func generateMissingEmbeddings(db *sql.DB) {
 
                 embVec,err := togetherEmbed([]string{tooBig})
                 if err != nil {
-                    // TODO also check error is actually having too many tokens
-                    stillBigEmbeds = append(stillBigEmbeds, tooBig)
-                    stillBigIds = append(stillBigIds, tooBigIds[i])
+                    // check if too many tokens
+                    if _,ok := err.(*TooManyInputTokensError); ok {
+                        stillBigEmbeds = append(stillBigEmbeds, tooBig)
+                        stillBigIds = append(stillBigIds, tooBigIds[i])
+                    } else { 
+                        log.Println(err.Error())
+                    }
                     continue
                 }
                 finishedEmbeds = append(finishedEmbeds, embVec[0])
@@ -644,7 +678,7 @@ func generateMissingEmbeddings(db *sql.DB) {
         
         fmt.Printf("\r%3d%%\n", 100)
     } else {
-        fmt.Printf("Generating %d embeddings... ", len(paperIds))
+        fmt.Printf("Generating %d embeddings...\n", len(paperIds))
         goodPaperIds := paperIds
         embeds, err := togetherEmbed(toEmbed)
         tooBigEmbeds := []string{}
@@ -652,15 +686,23 @@ func generateMissingEmbeddings(db *sql.DB) {
         goodEmbeds := [][EMBED_DIM]float32{}
         goodPaperIds = []uint64{}
         if err != nil {
-            // TODO make sure error is actually having too many tokens (currently assumed)
-            log.Println(err.Error())
+            // Check if error NOT too many tokens
+            if _,ok := err.(*TooManyInputTokensError); !ok {
+                log.Println(err.Error())
+                // return without embedding or any such thing
+                return
+            } 
 
             for j,emb := range(toEmbed) {
                 embVec, err := togetherEmbed([]string{emb})
                 if err != nil {
-                    // TODO also check error is actually having too many tokens
-                    tooBigEmbeds = append(tooBigEmbeds, emb)
-                    tooBigIds = append(tooBigIds, paperIds[j])
+                    // check if too many tokens
+                    if _,ok := err.(*TooManyInputTokensError); ok {
+                        tooBigEmbeds = append(tooBigEmbeds, emb)
+                        tooBigIds = append(tooBigIds, paperIds[j])
+                    } else { 
+                        log.Println(err.Error())
+                    }
                     continue
                 }
                 goodEmbeds = append(goodEmbeds, embVec[0])
@@ -690,9 +732,13 @@ func generateMissingEmbeddings(db *sql.DB) {
 
                 embVec,err := togetherEmbed([]string{tooBig})
                 if err != nil {
-                    // TODO also check error is actually having too many tokens
-                    stillBigEmbeds = append(stillBigEmbeds, tooBig)
-                    stillBigIds = append(stillBigIds, tooBigIds[i])
+                    // check if too many tokens
+                    if _,ok := err.(*TooManyInputTokensError); ok {
+                        stillBigEmbeds = append(stillBigEmbeds, tooBig)
+                        stillBigIds = append(stillBigIds, tooBigIds[i])
+                    } else { 
+                        log.Println(err.Error())
+                    }
                     continue
                 }
                 finishedEmbeds = append(finishedEmbeds, embVec[0])
