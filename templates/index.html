@@ -3,8 +3,8 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>{{ . }}</title>
-  <script src="/static/htmx.min.js"></script>
+  <title>{{ .Title }}</title>
+  <script src="{{.BasePath}}/static/htmx.min.js"></script>
   <style>
   </style>
 </head>
@@ -18,7 +18,7 @@
 
 
 {{ define "index" }}
-  {{ with "Arxiv Feed"}}{{template "baseHead" .}}{{ end }}
+  {{template "baseHead" .}}
   <div>
     <div>
         <button 
@@ -70,7 +70,7 @@
 
 
 {{define "signup"}}
-{{ with "Signup"}}{{template "baseHead" .}}{{ end }}
+{{template "baseHead" .}}
 <form hx-post="/api/signup">
     <label for="email">Email</label>
     <input id="email" name="email" type="email" placeholder="someone@example.com">
@@ -89,7 +89,7 @@
 
 
 {{define "login"}}
-{{ with "Login"}}{{template "baseHead" .}}{{ end }}
+{{template "baseHead" .}}
 <form hx-post="/api/login">
     <label for="email">Email</label>
     <input id="email" name="email" type="email" placeholder="someone@example.com">

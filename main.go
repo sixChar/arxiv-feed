@@ -884,8 +884,8 @@ type JWTClaims struct {
     jwt.RegisteredClaims
 }
 
-func createAndSetToken(w http.ResponseWriter, userId uint64) error {
 
+func createAndSetToken(w http.ResponseWriter, userId uint64) error {
     expirationTime := time.Now().Add(8 * time.Hour)
     claims := &JWTClaims{
         UserId: userId,
@@ -959,6 +959,30 @@ func authenticate(next http.Handler) http.Handler {
         next.ServeHTTP(w,r.WithContext(ctx))
     })
 }
+
+
+
+type BaseTemplateData struct {
+    BasePath string
+    Title string
+}
+
+func getBaseData(r *http.Request, title string) BaseTemplateData {
+    // Pass if proxied, ensures /static points to right place behind proxy
+    basePath := r.Header.Get("SCRIPT_NAME")
+
+    if basePath == "/" {
+        basePath = ""
+    }
+
+    data := BaseTemplateData{
+        BasePath: basePath,
+        Title: title,
+    }
+
+    return data
+}
+
 
 func main() {
     log.SetFlags(log.Lshortfile)
@@ -1041,48 +1065,33 @@ func main() {
         return
     }
 
-    // TODO port from args
     port := *portPtr
 
 
     fs := http.FileServer(http.Dir("./static"))
     http.Handle("/static/", http.StripPrefix("/static/", fs))
 
-    // TODO handle proxies gracefully
-    //tmpl := template.Must(template.ParseFiles("templates/index.html"))
-    //http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-    //    basePath := r.Header.Get("SCRIPT_NAME")
-
-    //    if basePath == "/" {
-    //        basePath = ""
-    //    }
-
-    //    data := TemplateData{
-    //        BasePath: basePath,
-    //    }
-
-    //    if err := tmpl.Execute(w, data); err != nil {
-    //        http.Error(w, err.Error(), http.StatusInternalServerError)
-    //    }
-    //})
 
     tmpl := template.Must(template.ParseFiles("templates/index.html"))
     http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-        if err := tmpl.ExecuteTemplate(w, "index", nil); err != nil {
+        data := getBaseData(r, "Arxiv Feed")
+        if err := tmpl.ExecuteTemplate(w, "index", data); err != nil {
             http.Error(w, err.Error(), http.StatusInternalServerError)
         }
     })
 
 
     http.HandleFunc("/signup", func(w http.ResponseWriter, r *http.Request) {
-        if err := tmpl.ExecuteTemplate(w, "signup", nil); err != nil {
+        data := getBaseData(r, "Signup")
+        if err := tmpl.ExecuteTemplate(w, "signup", data); err != nil {
             http.Error(w, err.Error(), http.StatusInternalServerError)
         }
     })
 
 
     http.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
-        if err := tmpl.ExecuteTemplate(w, "login", nil); err != nil {
+        data := getBaseData(r, "login")
+        if err := tmpl.ExecuteTemplate(w, "login", data); err != nil {
             http.Error(w, err.Error(), http.StatusInternalServerError)
         }
     })
