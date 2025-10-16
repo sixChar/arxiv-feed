@@ -98,7 +98,7 @@
 {{ define "index" }}
   {{template "baseHead" .}}
   <div>
-    <div id="controlPanel">
+    <!-- <div id="controlPanel">
         <button 
             hx-get="/api/refresh-subjects"
             hx-target="#queryResult"
@@ -111,6 +111,7 @@
             hx-swap="innerHTML"
         >Pull Papers</button>
     </div>
+    -->
 
     <form 
         hx-get="/api/keyword-search" 

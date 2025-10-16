@@ -35,6 +35,8 @@ const ARXIV_RSS_URL = "https://rss.arxiv.org/rss/"
 const RSS_TIME_LAYOUT_STR = "Mon, 02 Jan 2006 15:04:05 -0700"
 const ISO_86O1_TIME_LAYOUT_STR = "2006-01-02 15:04:05"
 
+// Run twice a day just to make sure no rss update (24 hour) is missed
+const PAPER_UPDATE_PERIOD = time.Hour * 12
 
 const EMBED_MODEL = "nomic-embed-text:v1.5"
 const EMBED_URL = "http://127.0.0.1:11434/api/embed"
@@ -308,8 +310,8 @@ func refreshSubjects(db *sql.DB) error {
         if err != nil {
             return err
         }
+        defer resp.Body.Close()
         body, err := io.ReadAll(resp.Body)
-        resp.Body.Close()
         if err != nil {
             return err
         }
@@ -386,8 +388,8 @@ func pullPapers(db *sql.DB, dotPath string) error {
     if err != nil {
         return err
     }
+    defer  resp.Body.Close()
     body, err := io.ReadAll(resp.Body)
-    resp.Body.Close()
     if err != nil {
         return err
     }
@@ -523,7 +525,7 @@ func writeEmbeds(db *sql.DB, paperIds []uint64, embeds [][EMBED_DIM]float32) err
     
     // query to insert a new paper
     insertNewEmbedding, err := tx.Prepare(`
-        INSERT INTO papers_vec (paper_id, embedding) VALUES (?, ?)
+        INSERT OR IGNORE INTO papers_vec (paper_id, embedding) VALUES (?, ?)
     `)
     if err != nil {
         _ = tx.Rollback()
@@ -984,6 +986,22 @@ func getBaseData(r *http.Request, title string) BaseTemplateData {
 }
 
 
+func fullUpdate(db *sql.DB, ctx context.Context) {
+    _ = ctx
+    // Refresh the list of subjects
+    refreshSubjects(db)
+
+    // Pull new papers
+    err := pullAllNewPapers(db)
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    // Embed any papers missing embeddings
+    generateMissingEmbeddings(db)
+}
+
+
 func main() {
     log.SetFlags(log.Lshortfile)
 
@@ -994,6 +1012,10 @@ func main() {
     }
     defer db.Close()
 
+    db.Exec(`PRAGMA journal_mode=WAL;`)
+    db.Exec(`PRAGMA busy_timeout=10000;`) 
+    db.SetMaxOpenConns(10)
+    db.SetMaxIdleConns(5)
 
     err = godotenv.Load()
     if err != nil {
@@ -1011,6 +1033,7 @@ func main() {
     numResultsPtr := flag.Int("n", 5, "Number of results to return for the query.")
     portPtr := flag.String("p", "8080", "Port to run the server on.")
     noServerPtr := flag.Bool("ns", false, "Set to not run the server. (i.e. only run the commands given by other flags)")
+    shouldAutoUpdatePtr := flag.Bool("au", false, "Automatically refresh subjects, pull papers, and build embeddings.")
 
     flag.Parse()
 
@@ -1066,6 +1089,28 @@ func main() {
     }
 
     port := *portPtr
+
+    ctx := context.Background()
+    if *shouldAutoUpdatePtr {
+        go func() {
+            start := time.Now()
+    
+            rctx, cancel := context.WithTimeout(ctx, 1 * time.Hour)
+            fullUpdate(db, rctx)
+            cancel()
+
+            next := start.Add(PAPER_UPDATE_PERIOD)
+            wait := time.Until(next)
+            if wait < 0 {
+                wait = 0 // if run exceeded period, start immediately
+            }
+            select {
+            case <-time.After(wait):
+            case <-ctx.Done():
+                return
+            }           
+        }()
+    }
 
 
     fs := http.FileServer(http.Dir("./static"))
@@ -1159,7 +1204,7 @@ func main() {
         var userId uint64
         var phash string
 
-        query := "SELECT id, phash FROM users WHERE email = $1"
+        query := "SELECT id, phash FROM users WHERE email = ?"
 
         err := db.QueryRowContext(r.Context(), query, email).Scan(&userId, &phash)
         if err != nil {
