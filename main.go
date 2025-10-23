@@ -680,6 +680,10 @@ func generateMissingEmbeddings(db *sql.DB) {
         
         fmt.Printf("\r%3d%%\n", 100)
     } else {
+	if len(toEmbed) == 0 {
+            fmt.Printf("Nothing to embed.\n")
+            return
+	}
         fmt.Printf("Generating %d embeddings...\n", len(paperIds))
         goodPaperIds := paperIds
         embeds, err := togetherEmbed(toEmbed)
@@ -918,20 +922,25 @@ func createAndSetToken(w http.ResponseWriter, userId uint64) error {
 
 
 func redirect(w http.ResponseWriter, r *http.Request, redirectURL string) {
+    basePath := r.Header.Get("SCRIPT_NAME")
+    if basePath == "/" {
+        basePath = ""
+    }
     if r.Header.Get("HX-Request") == "true" {
-        w.Header().Set("HX-Redirect", redirectURL)
+        w.Header().Set("HX-Redirect", basePath + redirectURL)
         w.WriteHeader(http.StatusOK)
         return
     }
-    http.Redirect(w, r, redirectURL, http.StatusSeeOther)
+    http.Redirect(w, r, basePath + redirectURL, http.StatusSeeOther)
 }
 
 
 func authenticate(next http.Handler) http.Handler {
     return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        redirectUrl := "/login"
         cookie, err := r.Cookie("token")
         if err != nil {
-            redirect(w, r, "/login")
+            redirect(w, r, redirectUrl)
             return
         }
 
@@ -947,13 +956,13 @@ func authenticate(next http.Handler) http.Handler {
 
         if err != nil {
             log.Println(err.Error())
-            redirect(w, r, "/login")
+            redirect(w, r, redirectUrl)
             return
         }
         
         if !token.Valid {
             log.Println("invalid token")
-            redirect(w, r, "/login")
+            redirect(w, r, redirectUrl)
             return
         }
         
@@ -972,7 +981,6 @@ type BaseTemplateData struct {
 func getBaseData(r *http.Request, title string) BaseTemplateData {
     // Pass if proxied, ensures /static points to right place behind proxy
     basePath := r.Header.Get("SCRIPT_NAME")
-
     if basePath == "/" {
         basePath = ""
     }
@@ -1146,6 +1154,7 @@ func main() {
         email := r.FormValue("email")
         password := r.FormValue("password")
         passConf := r.FormValue("passConf")
+
 
         if password != passConf {
             http.Error(w, "Passwords do not match", http.StatusUnprocessableEntity)
